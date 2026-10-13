@@ -84,13 +84,30 @@ export async function createWorktree(
   await git(repoDir, ["worktree", "add", "-q", "-b", branch, worktreePath, from]);
 }
 
-/** Commit everything in the worktree. Returns false when there was nothing to commit. */
-export async function commitWorktree(worktreePath: string, message: string): Promise<boolean> {
+/**
+ * Commit anything left uncommitted in the worktree, then report whether the
+ * branch actually adds work.
+ *
+ * The agent may have committed its own changes (many do). Checking only the
+ * working tree would call that "no changes" and discard the branch — losing the
+ * agent's commits. What matters is whether the branch is ahead of the base.
+ */
+export async function commitWorktree(
+  worktreePath: string,
+  message: string,
+  base: string,
+): Promise<boolean> {
   await git(worktreePath, ["add", "-A"]);
-  const changed = await git(worktreePath, ["status", "--porcelain"]);
-  if (!changed) return false;
-  await git(worktreePath, ["commit", "-qm", message]);
-  return true;
+  if (await git(worktreePath, ["status", "--porcelain"])) {
+    await git(worktreePath, ["commit", "-qm", message]);
+  }
+  return (await branchAheadOf(worktreePath, "HEAD", base)) > 0;
+}
+
+/** How many commits `branch` has that `base` does not. */
+export async function branchAheadOf(repoDir: string, branch: string, base: string): Promise<number> {
+  const out = await tryGit(repoDir, ["rev-list", "--count", `${base}..${branch}`]);
+  return out ? Number(out) || 0 : 0;
 }
 
 export async function removeWorktree(repoDir: string, worktreePath: string): Promise<void> {

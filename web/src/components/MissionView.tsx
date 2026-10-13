@@ -36,6 +36,7 @@ function TaskCard({
         <span className="name">{t.title}</span>
         <span className="tag">{t.agent}</span>
         {t.readOnly && <span className="tag">read-only</span>}
+        {t.fixRound && <span className="tag">fix round {t.fixRound}</span>}
         {t.integration && <span className="tag">{t.integration}</span>}
         <span className={`badge ${t.status}`}>{t.status}</span>
       </div>
@@ -64,6 +65,60 @@ function TaskCard({
           <>
             <div className="label">Error</div>
             <div className="error">{t.error}</div>
+          </>
+        )}
+        {t.review && (
+          <>
+            <div className="label">
+              Review verdict{" "}
+              <span
+                className={`badge ${
+                  t.review.status === "pass" ? "succeeded" : t.review.status === "fail" ? "failed" : "pending"
+                }`}
+              >
+                {t.review.status}
+              </span>
+            </div>
+            {t.review.checks && t.review.checks.length > 0 && (
+              <table className="checks">
+                <thead>
+                  <tr>
+                    <th>Check</th>
+                    <th>Result</th>
+                    <th>Evidence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {t.review.checks.map((c, i) => (
+                    <tr key={i}>
+                      <td>{c.name}</td>
+                      <td className={c.result === "fail" ? "error" : ""}>{c.result}</td>
+                      <td className="muted">{c.evidence}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {t.review.failures && t.review.failures.length > 0 && (
+              <>
+                <div className="label">Failures</div>
+                <ul className="findings">
+                  {t.review.failures.map((f, i) => (
+                    <li key={i}>
+                      <strong>[{f.severity ?? "major"}]</strong> {f.summary}
+                      {f.files && f.files.length > 0 && <span className="muted"> — {f.files.join(", ")}</span>}
+                      {f.suggestedFix && <div className="muted">fix: {f.suggestedFix}</div>}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {t.review.unparsed && (
+              <>
+                <div className="label">No usable verdict</div>
+                <pre className="muted">{t.review.unparsed}</pre>
+              </>
+            )}
           </>
         )}
         {(t.status === "failed" || t.status === "skipped") && onRetry && (
@@ -120,6 +175,14 @@ export default function MissionView({
         {mission.tasks.length > 0 && (
           <span>
             {done}/{mission.tasks.length} tasks done
+          </span>
+        )}
+        {mission.reviewVerdict && (
+          <span>
+            review <code>{mission.reviewVerdict}</code>
+            {mission.reviewRounds
+              ? ` · ${mission.reviewRounds} fix round${mission.reviewRounds > 1 ? "s" : ""}`
+              : ""}
           </span>
         )}
       </div>

@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import { listAgents, serverInfo } from "./opencode.js";
+import { describeError } from "./opencode.js";
 import {
   answerMission,
   clearMissions,
@@ -27,7 +28,7 @@ const fail = (res: express.Response, status: number, message: string) =>
 const wrap =
   (fn: (req: express.Request, res: express.Response) => Promise<unknown>) =>
   (req: express.Request, res: express.Response) => {
-    fn(req, res).catch((err) => fail(res, 400, (err as Error).message));
+    fn(req, res).catch((err) => fail(res, 400, describeError(err)));
   };
 
 const withWaves = (m: ReturnType<typeof getMission>) =>

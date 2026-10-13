@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { oc, type AssistantMessage } from "./opencode.js";
+import { oc, describeError, waitForTurn, type AssistantMessage } from "./opencode.js";
 import { ensureDirectory } from "./util.js";
 import {
+  branchAheadOf,
   commitWorktree,
   createWorktree,
   deleteBranch,
@@ -13,7 +14,15 @@ import {
   mergeBranch,
   removeWorktree,
 } from "./git.js";
-import type { Mission, MissionQuestion, MissionTask, ModelRef } from "./types.js";
+import type {
+  Mission,
+  MissionQuestion,
+  MissionTask,
+  ModelRef,
+  ReviewCheck,
+  ReviewFailure,
+  ReviewVerdict,
+} from "./types.js";
 
 export const missionEvents = new EventEmitter();
 missionEvents.setMaxListeners(100);
@@ -23,6 +32,10 @@ const missions = new Map<string, Mission>();
 const MAX_PARALLEL = Number(process.env.ORCHESTRA_MAX_PARALLEL ?? 3);
 const TASK_TIMEOUT_MS = Number(process.env.ORCHESTRA_TASK_TIMEOUT_MS ?? 1_200_000);
 const WORKTREE_ROOT = process.env.ORCHESTRA_WORKTREE_DIR ?? "/tmp/opencode/orchestra-worktrees";
+/** How many times the review loop may spawn a batch of fix tasks. */
+const MAX_REVIEW_ROUNDS = Number(process.env.ORCHESTRA_REVIEW_ROUNDS ?? 2);
+/** Upper bound on fix tasks spawned from one review verdict. */
+const MAX_FIXES_PER_ROUND = Number(process.env.ORCHESTRA_MAX_FIXES_PER_ROUND ?? 5);
 
 const ALLOW_ALL = [{ action: "*", resource: "*", effect: "allow" as const }];
 const READ_ONLY = [
@@ -41,14 +54,31 @@ const DATA_FILE =
 function loadHistory() {
   try {
     const saved = JSON.parse(readFileSync(DATA_FILE, "utf8")) as Mission[];
+    let corrected = false;
+
     for (const m of saved) {
       // A mission that was mid-flight when the server stopped cannot be resumed.
       if (m.status === "running" || m.status === "planning") {
         m.status = "failed";
         m.error = "interrupted by a server restart";
+        m.finishedAt = m.finishedAt ?? Date.now();
+        // A task that was mid-flight is not running any more — without this it
+        // would show as "running" forever, next to a "failed" mission.
+        for (const t of m.tasks) {
+          if (t.status === "running") {
+            t.status = "failed";
+            t.error = "interrupted by a server restart";
+            t.finishedAt = t.finishedAt ?? Date.now();
+          }
+        }
+        corrected = true;
       }
       missions.set(m.id, m);
     }
+
+    // Write the correction back, otherwise the file disagrees with memory and
+    // the same stale state is re-loaded on the next start.
+    if (corrected) persist();
   } catch {
     /* no history yet */
   }
@@ -62,7 +92,7 @@ function persist() {
     try {
       writeFileSync(DATA_FILE, JSON.stringify(listMissions(), null, 2));
     } catch (err) {
-      console.error("[missions] could not save history:", (err as Error).message);
+      console.error("[missions] could not save history:", describeError(err));
     }
   }, 500);
 }
@@ -77,15 +107,7 @@ function emit(m: Mission) {
   persist();
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  return Promise.race([
-    p,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
-  ]);
-}
-
-function extractText(m: AssistantMessage): string {
-  return (m.content ?? [])
+function extractText(m: AssistantMessage): string {  return (m.content ?? [])
     .filter((c) => c.type === "text")
     .map((c) => c.text ?? "")
     .join("")
@@ -132,17 +154,18 @@ async function promptAndWait(sessionID: string, text: string, timeoutLabel: stri
     `/api/session/${sessionID}/prompt`,
     { text },
   );
-  await withTimeout(
-    oc("POST", `/api/experimental/session/${sessionID}/wait`),
-    TASK_TIMEOUT_MS,
-    timeoutLabel,
-  );
+  const promptTime = prompted.data.time.created;
+
+  // Poll for the turn to finish rather than holding one long HTTP request open.
+  const idle = await waitForTurn(sessionID, promptTime, TASK_TIMEOUT_MS, timeoutLabel);
+
   const msgs = await oc<{ data: AssistantMessage[] }>("GET", `/api/session/${sessionID}/message`);
   const assistant = msgs.data.find(
-    (m) => m.type === "assistant" && (m.time?.created ?? 0) >= prompted.data.time.created - 1000,
+    (m) => m.type === "assistant" && (m.time?.created ?? 0) >= promptTime - 1000,
   );
   if (!assistant) throw new Error("No response was produced");
   if (assistant.error) throw new Error(assistant.error.message ?? assistant.error.type ?? "Agent error");
+  if (idle.outcome === "interrupted") throw new Error("The agent was interrupted");
   return extractText(assistant) || "(empty response)";
 }
 
@@ -155,8 +178,11 @@ async function askOnce(opts: {
   title: string;
   readOnly: boolean;
   timeoutLabel: string;
+  /** Called as soon as the session exists, so failures stay traceable. */
+  onSession?: (sessionID: string) => void;
 }): Promise<{ text: string; sessionID: string }> {
   const sessionID = await openSession(opts);
+  opts.onSession?.(sessionID);
   const text = await promptAndWait(sessionID, opts.prompt, opts.timeoutLabel);
   return { text, sessionID };
 }
@@ -419,7 +445,7 @@ export function createMission(input: {
   emit(m);
   void planMission(m).catch((err) => {
     m.status = "failed";
-    m.error = (err as Error).message;
+    m.error = describeError(err);
     m.finishedAt = Date.now();
     emit(m);
   });
@@ -632,7 +658,7 @@ export async function reviseMissionPlan(id: string, instruction: string): Promis
     m.tasks = await ensureDetailedPrompts(sessionID, reviewed);
     m.revisions = [...(m.revisions ?? []), request];
   } catch (err) {
-    m.error = `Revision failed: ${(err as Error).message}`;
+    m.error = `Revision failed: ${describeError(err)}`;
   }
 
   m.status = "ready";
@@ -655,7 +681,7 @@ export function startMission(id: string): Mission {
   emit(m);
   void execute(m).catch((err) => {
     m.status = "failed";
-    m.error = (err as Error).message;
+    m.error = describeError(err);
     m.finishedAt = Date.now();
     emit(m);
   });
@@ -671,6 +697,7 @@ function resetTask(t: MissionTask) {
   t.worktree = undefined;
   t.branch = undefined;
   t.sessionID = undefined;
+  t.review = undefined;
   t.startedAt = undefined;
   t.finishedAt = undefined;
 }
@@ -714,7 +741,7 @@ export function retryMission(id: string, taskId?: string): Mission {
   emit(m);
   void execute(m).catch((err) => {
     m.status = "failed";
-    m.error = (err as Error).message;
+    m.error = describeError(err);
     m.finishedAt = Date.now();
     emit(m);
   });
@@ -746,16 +773,161 @@ Your task ${task.id}: ${task.title}
 
 ${sandbox(task.prompt)}${upstream}
 
-When finished, give a concise summary of what you changed and why. Make sensible decisions without asking questions.`;
+When finished, give a concise summary of what you changed and why. Make sensible decisions without asking questions.${isReviewTask(m, task) ? REVIEW_CONTRACT : ""}`;
 }
 
-async function execute(m: Mission) {
-  const prep = await ensureRepo(m.targetDirectory);
-  m.notes.push(...prep.notes);
-  const base = prep.baseBranch;
-  const byId = (id: string) => m.tasks.find((t) => t.id === id);
-  emit(m);
+/* ------------------------------- review loop -------------------------------- */
 
+const REVIEW_CONTRACT = `
+
+OUTPUT CONTRACT — this is a review task. Reply with ONLY this JSON object, no prose and no code fences:
+
+{"status":"pass"|"fail","checks":[{"name":"what you checked","result":"pass"|"fail","evidence":"the exact command you ran and its output"}],"failures":[{"summary":"what is wrong","files":["path/to/file"],"suggestedFix":"the smallest concrete change that fixes it","severity":"blocker"|"major"|"minor"}]}
+
+Rules:
+- Verify by RUNNING things, not by reading alone. Determine the project's test/build command (for example from package.json) and run it, then put the exact command and its real output in "evidence".
+- Set "status" to "fail" if any failure has severity "blocker" or "major". Use "minor" for nits that should not block.
+- Report only real defects with file references. Do not invent failures to look thorough; an empty "failures" list is a valid and good answer.
+- If everything is correct, reply {"status":"pass","checks":[...],"failures":[]}.`;
+
+/** The terminal read-only review task: nothing depends on it. */
+function isReviewTask(m: Mission, task: MissionTask): boolean {
+  const dependedOn = new Set(m.tasks.flatMap((t) => t.dependsOn));
+  return (
+    !dependedOn.has(task.id) &&
+    (task.readOnly === true || task.agent === "general") &&
+    /\b(review|verify|audit)\b/i.test(task.title)
+  );
+}
+
+function findReviewTask(m: Mission): MissionTask | undefined {
+  return m.tasks.filter((t) => isReviewTask(m, t)).pop();
+}
+
+/** Parse the review task's JSON verdict; never throws. */
+function parseVerdict(text: string): ReviewVerdict {
+  try {
+    const parsed = extractJson(text);
+    const status = parsed?.status === "fail" ? "fail" : parsed?.status === "pass" ? "pass" : undefined;
+    if (!status) throw new Error("no status field");
+
+    const checks: ReviewCheck[] = Array.isArray(parsed.checks)
+      ? parsed.checks
+          .map((c: any) => ({
+            name: String(c?.name ?? "").trim(),
+            result: String(c?.result ?? "").trim(),
+            ...(c?.evidence ? { evidence: String(c.evidence).slice(0, 600) } : {}),
+          }))
+          .filter((c: ReviewCheck) => c.name)
+      : [];
+
+    const failures: ReviewFailure[] = Array.isArray(parsed.failures)
+      ? parsed.failures
+          .map((f: any): ReviewFailure => ({
+            summary: String(f?.summary ?? "").trim(),
+            files: Array.isArray(f?.files) ? f.files.map(String).slice(0, 8) : [],
+            ...(f?.suggestedFix ? { suggestedFix: String(f.suggestedFix) } : {}),
+            severity: ["blocker", "major", "minor"].includes(f?.severity) ? f.severity : "major",
+          }))
+          .filter((f: ReviewFailure) => f.summary)
+      : [];
+
+    return { status, checks, failures };
+  } catch {
+    return { status: "unknown", unparsed: text.slice(0, 4000) };
+  }
+}
+
+function buildFixPrompt(m: Mission, failure: ReviewFailure, round: number): string {
+  return `A verification review of this repository found a defect that must be fixed.
+
+Overall idea:
+${m.idea}
+
+The reviewer reported (severity ${failure.severity ?? "major"}, fix round ${round}):
+${failure.summary}
+${failure.files?.length ? `\nFiles involved: ${failure.files.join(", ")}` : ""}
+${failure.suggestedFix ? `\nSuggested fix: ${failure.suggestedFix}` : ""}
+
+Fix this now in the current working directory. Keep the change minimal and focused; do not refactor unrelated code and do not break existing behaviour or tests. If the reviewer's diagnosis turns out to be wrong, say so plainly instead of making a pointless change. Then state briefly what you changed and how you verified it.`;
+}
+
+/** Turn a failing verdict into concrete fix tasks. */
+function spawnFixes(m: Mission, verdict: ReviewVerdict, round: number): MissionTask[] {
+  const actionable = (verdict.failures ?? []).filter((f) => f.severity !== "minor");
+  const created: MissionTask[] = [];
+
+  for (const [i, failure] of actionable.slice(0, MAX_FIXES_PER_ROUND).entries()) {
+    const id = `fix${round}-${i + 1}`;
+    if (m.tasks.some((t) => t.id === id)) continue;
+    const task: MissionTask = {
+      id,
+      title: `Fix: ${failure.summary}`.slice(0, 90),
+      agent: "build",
+      prompt: buildFixPrompt(m, failure, round),
+      dependsOn: [],
+      readOnly: false,
+      status: "pending",
+      fixRound: round,
+    };
+    m.tasks.push(task);
+    created.push(task);
+  }
+
+  const skipped = actionable.length - created.length;
+  if (skipped > 0) m.notes.push(`review round ${round}: ${skipped} failure(s) beyond the per-round cap of ${MAX_FIXES_PER_ROUND}`);
+  return created;
+}
+
+/**
+ * Final review failed -> spawn fix tasks -> re-run the review, bounded by
+ * MAX_REVIEW_ROUNDS. The review task is reused: its dependencies are extended
+ * with the fix tasks and it is queued again.
+ */
+async function runReviewLoop(m: Mission, base: string) {
+  const review = findReviewTask(m);
+  if (!review) return;
+
+  m.reviewVerdict = review.review?.status ?? "unknown";
+  if (m.reviewVerdict === "unknown") {
+    m.notes.push("review returned no usable verdict; skipping the fix loop");
+  }
+  if (m.reviewVerdict !== "fail") return;
+
+  for (let round = 1; round <= MAX_REVIEW_ROUNDS; round++) {
+    if (review.status !== "succeeded") break;
+
+    const fixes = spawnFixes(m, review.review!, round);
+    if (fixes.length === 0) {
+      m.notes.push(`review round ${round}: no blocker/major failures to fix`);
+      break;
+    }
+
+    m.reviewRounds = round;
+    m.notes.push(
+      `review round ${round}: spawned ${fixes.length} fix task(s) — ${fixes.map((f) => f.id).join(", ")}`,
+    );
+    review.dependsOn = [...new Set([...review.dependsOn, ...fixes.map((f) => f.id)])];
+    resetTask(review);
+    emit(m);
+
+    await schedulePending(m, base);
+
+    if (fixes.some((f) => f.status !== "succeeded")) {
+      m.notes.push(`review round ${round}: a fix task did not succeed; stopping the loop`);
+      break;
+    }
+
+    m.reviewVerdict = review.review?.status ?? "unknown";
+    if (m.reviewVerdict !== "fail") break;
+  }
+
+  m.reviewVerdict = review.review?.status ?? "unknown";
+}
+
+/** Run every pending task that is not blocked, in parallel waves. */
+async function schedulePending(m: Mission, base: string) {
+  const byId = (id: string) => m.tasks.find((t) => t.id === id);
   const active = new Map<string, Promise<void>>();
 
   for (;;) {
@@ -779,9 +951,23 @@ async function execute(m: Mission) {
     if (active.size === 0) break;
     await Promise.race(active.values());
   }
+}
 
-  const failed = m.tasks.some((t) => t.status === "failed" || t.status === "skipped");
-  m.status = failed ? "failed" : "succeeded";
+async function execute(m: Mission) {
+  const prep = await ensureRepo(m.targetDirectory);
+  m.notes.push(...prep.notes);
+  const base = prep.baseBranch;
+  emit(m);
+
+  await schedulePending(m, base);
+  await runReviewLoop(m, base);
+
+  const broke = m.tasks.some((t) => t.status === "failed" || t.status === "skipped");
+  const unresolved = m.reviewVerdict === "fail";
+  m.status = broke || unresolved ? "failed" : "succeeded";
+  if (unresolved && !broke) {
+    m.error = `the final review still reports failures after ${m.reviewRounds ?? 0} fix round(s)`;
+  }
   m.finishedAt = Date.now();
   emit(m);
 }
@@ -811,11 +997,23 @@ async function runTask(m: Mission, task: MissionTask, base: string) {
       title: `${task.title} — ${m.id}/${task.id}`,
       readOnly,
       timeoutLabel: `Task ${task.id}`,
+      onSession: (id) => {
+        // Record the session before waiting so a failure is still traceable.
+        task.sessionID = id;
+        emit(m);
+      },
     });
     task.sessionID = sessionID;
     task.output = text;
 
-    const committed = await commitWorktree(worktree, `orchestra(${task.id}): ${task.title}`);
+    // The final review must return a machine-readable verdict so the fix loop
+    // can act on it.
+    if (isReviewTask(m, task)) {
+      task.review = parseVerdict(text);
+      emit(m);
+    }
+
+    const committed = await commitWorktree(worktree, `orchestra(${task.id}): ${task.title}`, base);
     if (!committed) {
       task.integration = "no-changes";
       task.status = "succeeded";
@@ -838,10 +1036,15 @@ async function runTask(m: Mission, task: MissionTask, base: string) {
     }
   } catch (err) {
     task.status = "failed";
-    task.error = (err as Error).message;
-    // Nothing was committed, so leave no worktree or branch behind.
+    task.error = describeError(err);
+    // Never silently destroy work the agent committed before failing.
+    const ahead = await branchAheadOf(m.targetDirectory, branch, base);
     await removeWorktree(m.targetDirectory, worktree);
-    await deleteBranch(m.targetDirectory, branch);
+    if (ahead > 0) {
+      m.notes.push(`task ${task.id}: failed, but its ${ahead} commit(s) are kept on ${branch}`);
+    } else {
+      await deleteBranch(m.targetDirectory, branch);
+    }
   } finally {
     task.finishedAt = Date.now();
     emit(m);

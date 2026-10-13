@@ -20,6 +20,27 @@ export type MissionStatus =
   | "succeeded"
   | "failed";
 
+export interface ReviewCheck {
+  name: string;
+  result: string;
+  evidence?: string;
+}
+
+export interface ReviewFailure {
+  summary: string;
+  files?: string[];
+  suggestedFix?: string;
+  severity?: "blocker" | "major" | "minor";
+}
+
+export interface ReviewVerdict {
+  status: "pass" | "fail" | "unknown";
+  checks?: ReviewCheck[];
+  failures?: ReviewFailure[];
+  /** The raw reply when it was not valid JSON. */
+  unparsed?: string;
+}
+
 export interface MissionTask {
   id: string;
   title: string;
@@ -36,6 +57,10 @@ export interface MissionTask {
   output?: string;
   error?: string;
   integration?: "merged" | "conflict" | "skipped" | "no-changes";
+  /** For the final review task: the parsed verdict it returned. */
+  review?: ReviewVerdict;
+  /** Which review round produced this fix task. */
+  fixRound?: number;
   startedAt?: number;
   finishedAt?: number;
 }
@@ -56,6 +81,10 @@ export interface Mission {
   ctoSessionID?: string;
   /** Instructions the user has asked the CTO to apply, in order. */
   revisions?: string[];
+  /** Outcome of the final review, after any fix rounds. */
+  reviewVerdict?: "pass" | "fail" | "unknown";
+  /** How many fix rounds the review loop ran. */
+  reviewRounds?: number;
   error?: string;
   createdAt: number;
   updatedAt: number;
